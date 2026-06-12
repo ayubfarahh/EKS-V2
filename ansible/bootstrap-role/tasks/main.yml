@@ -1,0 +1,24 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for bootstrap-role
+- amazon.aws.s3_bucket:
+    name: ecsv3-bucket
+    state: present
+    encryption: "AES256"
+
+- name: ecr-repo
+  community.aws.ecs_ecr:
+    name: "{{ item }}"
+    state: present
+    region: eu-west-2
+  loop:
+    - api-gateway
+    - order-service
+    - inventory-service
+    - payment-service
+    - shipping-service
+    - notification-service
+    - dashboard-api
+    - worker
+    - scheduler
+ 

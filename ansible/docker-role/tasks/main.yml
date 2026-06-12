@@ -1,0 +1,28 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for docker-role
+- name: Log in to ECR
+  community.docker.docker_login:
+    registry_url: "{{ account_id }}.dkr.ecr.{{ region }}.amazonaws.com"
+    username: AWS
+    password: "{{ lookup('pipe', 'aws ecr get-login-password --region ' + region) }}"
+
+- name: Build and push images
+  community.docker.docker_image:
+    name: "{{ account_id }}.dkr.ecr.{{ region }}.amazonaws.com/{{ item }}"
+    tag: latest
+    build:
+      path: "{{ playbook_dir }}/../services/{{ item }}"
+    source: build
+    push: true
+    state: present
+  loop:
+    - api-gateway
+    - order-service
+    - inventory-service
+    - payment-service
+    - shipping-service
+    - notification-service
+    - dashboard-api
+    - worker
+    - scheduler

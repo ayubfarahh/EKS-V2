@@ -1,0 +1,5 @@
+#SPDX-License-Identifier: MIT-0
+---
+# vars file for docker-role
+ region: eu-west-2
+ account_id: "{{ lookup('pipe', 'aws sts get-caller-identity --query Account --output text') }}"
