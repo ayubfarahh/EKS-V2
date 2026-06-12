@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="images/coderco.jpg" alt="CoderCo" width="200"/>
-</p>
-
 # EKS v2 - Order Fulfillment Platform
 
 A multi-service order platform on Amazon EKS. Nine services, one cluster, stateful workloads running on Kubernetes. The application code is provided. You build everything else.
