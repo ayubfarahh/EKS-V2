@@ -17,6 +17,7 @@ import (
 )
 
 var db *sql.DB
+var sqsClient *SQSClient
 
 type Order struct {
 	ID         int             `json:"id"`
@@ -71,6 +72,12 @@ func main() {
 
 	waitForDB()
 	migrate()
+
+	if c, err := newSQSClient(); err != nil {
+		log.Printf("WARNING: SQS client init failed, events disabled: %v", err)
+	} else {
+		sqsClient = c
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
@@ -372,20 +379,11 @@ func handleUpdateStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func publishEvent(eventType string, payload map[string]interface{}) {
-	sqsQueue := os.Getenv("SQS_QUEUE_URL")
-	if sqsQueue == "" {
+	if sqsClient == nil || !sqsClient.isConfigured() {
 		log.Printf("Event (no SQS): %s %v", eventType, payload)
 		return
 	}
-
-	event := map[string]interface{}{
-		"type":      eventType,
-		"payload":   payload,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	}
-	data, _ := json.Marshal(event)
-	log.Printf("Event -> SQS: %s", string(data))
-	// Students implement actual SQS SendMessage here
+	sqsClient.publish(context.Background(), eventType, payload)
 }
 
 func httpError(w http.ResponseWriter, msg string, code int) {

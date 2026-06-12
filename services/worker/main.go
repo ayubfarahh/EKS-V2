@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -11,20 +14,19 @@ import (
 	"time"
 )
 
-// Event represents a message from SQS
-type Event struct {
-	Type      string                 `json:"type"`
-	Payload   map[string]interface{} `json:"payload"`
-	Timestamp string                 `json:"timestamp"`
-}
+var sqsClient *SQSClient
 
 func main() {
-	sqsQueue := os.Getenv("SQS_QUEUE_URL")
-	if sqsQueue == "" {
+	if os.Getenv("SQS_QUEUE_URL") == "" {
 		log.Fatal("SQS_QUEUE_URL is required")
 	}
 
-	// Internal service URLs for event-driven calls
+	var err error
+	sqsClient, err = newSQSClient()
+	if err != nil {
+		log.Fatalf("failed to init SQS client: %v", err)
+	}
+
 	services := map[string]string{
 		"inventory":    getEnv("INVENTORY_SERVICE_URL", "http://inventory-service:8082"),
 		"payment":      getEnv("PAYMENT_SERVICE_URL", "http://payment-service:8083"),
@@ -36,7 +38,6 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Health check endpoint
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
@@ -49,7 +50,6 @@ func main() {
 		http.ListenAndServe(":"+port, mux)
 	}()
 
-	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -59,10 +59,10 @@ func main() {
 	}()
 
 	log.Println("Worker started, polling SQS for events...")
-	pollAndProcess(ctx, sqsQueue, services)
+	pollAndProcess(ctx, services)
 }
 
-func pollAndProcess(ctx context.Context, queueURL string, services map[string]string) {
+func pollAndProcess(ctx context.Context, services map[string]string) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	for {
@@ -71,119 +71,263 @@ func pollAndProcess(ctx context.Context, queueURL string, services map[string]st
 			log.Println("Worker stopped")
 			return
 		default:
-			messages := receiveSQSMessages(ctx, queueURL)
-
-			for _, raw := range messages {
-				var event Event
-				if err := json.Unmarshal([]byte(raw), &event); err != nil {
-					log.Printf("Failed to parse event: %v", err)
+			messages, handles, err := sqsClient.receive(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
 					continue
 				}
+				log.Printf("ERROR: receive failed: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
 
+			for i, event := range messages {
 				log.Printf("Processing event: %s", event.Type)
 
 				if err := handleEvent(client, services, event); err != nil {
-					log.Printf("Failed to handle event %s: %v", event.Type, err)
-					// In production: don't delete from SQS, let it retry or go to DLQ
+					log.Printf("Failed to handle event %s: %v (will retry via SQS)", event.Type, err)
 					continue
 				}
 
+				if err := sqsClient.delete(ctx, handles[i]); err != nil {
+					log.Printf("WARNING: failed to delete message: %v", err)
+				}
 				log.Printf("Successfully processed: %s", event.Type)
-				// Delete message from SQS after successful processing
-			}
-
-			if len(messages) == 0 {
-				time.Sleep(5 * time.Second)
 			}
 		}
 	}
 }
 
-func handleEvent(client *http.Client, services map[string]string, event Event) error {
+func handleEvent(client *http.Client, services map[string]string, event SQSMessage) error {
 	switch event.Type {
 
 	case "order.created":
-		// 1. Reserve inventory
-		log.Printf("  -> Reserving inventory for order")
-		// POST to inventory-service/reserve with order items
-		// If reservation fails, update order status to "cancelled"
+		orderID := sqsGetInt(event.Payload, "order_id")
+		customerID := sqsGetString(event.Payload, "customer_id")
+		total := sqsGetFloat(event.Payload, "total")
+		currency := sqsGetString(event.Payload, "currency")
 
-		// 2. Process payment
-		log.Printf("  -> Processing payment")
-		// POST to payment-service/charge
-		// If payment fails, release inventory reservation
+		log.Printf("  -> Reserving inventory for order #%d", orderID)
+		code, err := postJSON(client, services["inventory"]+"/reserve", map[string]interface{}{
+			"order_id": orderID,
+			"items":    event.Payload["items"],
+		})
+		if err != nil {
+			return fmt.Errorf("inventory unreachable: %w", err)
+		}
+		if code != http.StatusCreated {
+			log.Printf("  -> Reservation failed (%d), cancelling order #%d", code, orderID)
+			putJSON(client, services["order"]+"/status", map[string]interface{}{
+				"order_id": orderID, "new_status": "cancelled",
+			})
+			postJSON(client, services["notification"]+"/send", map[string]interface{}{
+				"recipient": customerID, "template": "payment_failed",
+				"data": map[string]interface{}{"OrderID": orderID},
+			})
+			return nil
+		}
 
-		// 3. Send confirmation notification
+		log.Printf("  -> Processing payment for order #%d", orderID)
+		code, err = postJSON(client, services["payment"]+"/charge", map[string]interface{}{
+			"order_id":    orderID,
+			"customer_id": customerID,
+			"amount":      total,
+			"currency":    currency,
+			"method":      "card",
+		})
+		if err != nil {
+			postJSON(client, services["inventory"]+"/release", map[string]interface{}{"order_id": orderID})
+			return fmt.Errorf("payment unreachable: %w", err)
+		}
+		if code == http.StatusPaymentRequired {
+			log.Printf("  -> Payment declined for order #%d, cancelling", orderID)
+			postJSON(client, services["inventory"]+"/release", map[string]interface{}{"order_id": orderID})
+			putJSON(client, services["order"]+"/status", map[string]interface{}{
+				"order_id": orderID, "new_status": "cancelled",
+			})
+			postJSON(client, services["notification"]+"/send", map[string]interface{}{
+				"recipient": customerID, "template": "payment_failed",
+				"data": map[string]interface{}{"OrderID": orderID},
+			})
+			return nil
+		}
+		if code != http.StatusCreated {
+			return fmt.Errorf("unexpected charge response: %d", code)
+		}
+
 		log.Printf("  -> Sending order confirmation")
-		// POST to notification-service/send with order_confirmed template
+		postJSON(client, services["notification"]+"/send", map[string]interface{}{
+			"recipient": customerID, "template": "order_confirmed",
+			"data": map[string]interface{}{"OrderID": orderID, "Total": total, "Currency": currency},
+		})
 
-		// 4. Update order to confirmed
-		log.Printf("  -> Confirming order")
-		// PUT to order-service/status with new_status: "confirmed"
+		log.Printf("  -> Confirming order #%d", orderID)
+		code, err = putJSON(client, services["order"]+"/status", map[string]interface{}{
+			"order_id": orderID, "new_status": "confirmed",
+		})
+		if err != nil {
+			return fmt.Errorf("order service unreachable: %w", err)
+		}
+		if code != http.StatusOK && code != http.StatusConflict {
+			return fmt.Errorf("unexpected status update response: %d", code)
+		}
 
 	case "order.status_changed":
-		newStatus, _ := event.Payload["new_status"].(string)
+		orderID := sqsGetInt(event.Payload, "order_id")
+		newStatus := sqsGetString(event.Payload, "new_status")
 
 		switch newStatus {
+		case "confirmed":
+			log.Printf("  -> Order #%d confirmed, moving to processing", orderID)
+			code, err := putJSON(client, services["order"]+"/status", map[string]interface{}{
+				"order_id": orderID, "new_status": "processing",
+			})
+			if err != nil {
+				return fmt.Errorf("order service unreachable: %w", err)
+			}
+			if code != http.StatusOK && code != http.StatusConflict {
+				return fmt.Errorf("unexpected response: %d", code)
+			}
+
 		case "processing":
-			// Create shipment
-			log.Printf("  -> Creating shipment for order")
-			// POST to shipping-service/shipments
+			log.Printf("  -> Creating shipment for order #%d", orderID)
+			code, err := postJSON(client, services["shipping"]+"/shipments", map[string]interface{}{
+				"order_id":       orderID,
+				"carrier":        "royal_mail",
+				"recipient_name": "Customer",
+				"address_line1":  "1 Demo Street",
+				"city":           "London",
+				"postcode":       "E1 1AA",
+				"country":        "GB",
+				"weight_kg":      1.0,
+			})
+			if err != nil {
+				return fmt.Errorf("shipping unreachable: %w", err)
+			}
+			if code != http.StatusCreated {
+				return fmt.Errorf("shipment creation failed: %d", code)
+			}
 
 		case "shipped":
-			// Notify customer
 			log.Printf("  -> Sending shipping notification")
-			// POST to notification-service/send with order_shipped template
+			postJSON(client, services["notification"]+"/send", map[string]interface{}{
+				"recipient": "customer", "template": "order_shipped",
+				"data": map[string]interface{}{"OrderID": orderID},
+			})
 
 		case "delivered":
 			log.Printf("  -> Sending delivery notification")
-			// POST to notification-service/send with order_delivered template
+			postJSON(client, services["notification"]+"/send", map[string]interface{}{
+				"recipient": "customer", "template": "order_delivered",
+				"data": map[string]interface{}{"OrderID": orderID},
+			})
 
 		case "cancelled":
-			// Release inventory
-			log.Printf("  -> Releasing inventory reservation")
-			// POST to inventory-service/release
-
-			// Process refund if payment was made
-			log.Printf("  -> Processing refund")
-			// POST to payment-service/refund
+			log.Printf("  -> Releasing inventory for cancelled order #%d", orderID)
+			if _, err := postJSON(client, services["inventory"]+"/release", map[string]interface{}{
+				"order_id": orderID,
+			}); err != nil {
+				return fmt.Errorf("inventory unreachable: %w", err)
+			}
 		}
 
 	case "payment.completed":
-		log.Printf("  -> Payment successful, confirming order")
-		// Update order status to confirmed
+		orderID := sqsGetInt(event.Payload, "order_id")
+		log.Printf("  -> Payment completed for order #%d, ensuring confirmed", orderID)
+		code, err := putJSON(client, services["order"]+"/status", map[string]interface{}{
+			"order_id": orderID, "new_status": "confirmed",
+		})
+		if err != nil {
+			return fmt.Errorf("order service unreachable: %w", err)
+		}
+		if code != http.StatusOK && code != http.StatusConflict {
+			return fmt.Errorf("unexpected response: %d", code)
+		}
 
 	case "payment.failed":
-		log.Printf("  -> Payment failed, cancelling order")
-		// Release inventory reservation
-		// Update order status to cancelled
-		// Send payment failed notification
+		orderID := sqsGetInt(event.Payload, "order_id")
+		log.Printf("  -> Payment failed for order #%d, ensuring cancelled", orderID)
+		postJSON(client, services["inventory"]+"/release", map[string]interface{}{"order_id": orderID})
+		code, err := putJSON(client, services["order"]+"/status", map[string]interface{}{
+			"order_id": orderID, "new_status": "cancelled",
+		})
+		if err != nil {
+			return fmt.Errorf("order service unreachable: %w", err)
+		}
+		if code != http.StatusOK && code != http.StatusConflict {
+			return fmt.Errorf("unexpected response: %d", code)
+		}
+
+	case "payment.refunded":
+		log.Printf("  -> Refund processed for order #%d", sqsGetInt(event.Payload, "order_id"))
 
 	case "shipment.created":
-		log.Printf("  -> Shipment created, updating order to processing")
-		// Update order status
+		log.Printf("  -> Shipment created for order #%d", sqsGetInt(event.Payload, "order_id"))
+
+	case "shipment.in_transit":
+		orderID := sqsGetInt(event.Payload, "order_id")
+		log.Printf("  -> Shipment in transit, marking order #%d shipped", orderID)
+		code, err := putJSON(client, services["order"]+"/status", map[string]interface{}{
+			"order_id": orderID, "new_status": "shipped",
+		})
+		if err != nil {
+			return fmt.Errorf("order service unreachable: %w", err)
+		}
+		if code != http.StatusOK && code != http.StatusConflict {
+			return fmt.Errorf("unexpected response: %d", code)
+		}
 
 	case "shipment.delivered":
-		log.Printf("  -> Shipment delivered, updating order")
-		// Update order status to delivered
-		// Send delivery notification
+		orderID := sqsGetInt(event.Payload, "order_id")
+		log.Printf("  -> Shipment delivered, marking order #%d delivered", orderID)
+		code, err := putJSON(client, services["order"]+"/status", map[string]interface{}{
+			"order_id": orderID, "new_status": "delivered",
+		})
+		if err != nil {
+			return fmt.Errorf("order service unreachable: %w", err)
+		}
+		if code != http.StatusOK && code != http.StatusConflict {
+			return fmt.Errorf("unexpected response: %d", code)
+		}
 
 	default:
 		log.Printf("  -> Unknown event type: %s (skipping)", event.Type)
 	}
 
-	_ = client
-	_ = services
 	return nil
 }
 
-func receiveSQSMessages(ctx context.Context, queueURL string) []string {
-	// Students implement with AWS SDK SQS ReceiveMessage
-	// Use long polling: WaitTimeSeconds = 20
-	// MaxNumberOfMessages = 10
-	// Honour ctx during the long-poll so SIGTERM unblocks cleanly
-	_ = ctx
-	return nil
+func postJSON(client *http.Client, url string, body interface{}) (int, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(data))
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
+}
+
+func putJSON(client *http.Client, url string, body interface{}) (int, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(data))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
 }
 
 func getEnv(key, fallback string) string {

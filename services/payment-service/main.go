@@ -18,6 +18,7 @@ import (
 )
 
 var db *sql.DB
+var sqsClient *SQSClient
 
 func main() {
 	dbURL := os.Getenv("DATABASE_URL")
@@ -37,6 +38,12 @@ func main() {
 	db.SetConnMaxLifetime(5 * time.Minute)
 	waitForDB()
 	migrate()
+
+	if c, err := newSQSClient(); err != nil {
+		log.Printf("WARNING: SQS client init failed, events disabled: %v", err)
+	} else {
+		sqsClient = c
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
@@ -372,18 +379,11 @@ func generatePaymentID() string {
 }
 
 func publishEvent(eventType string, payload map[string]interface{}) {
-	sqsQueue := os.Getenv("SQS_QUEUE_URL")
-	if sqsQueue == "" {
+	if sqsClient == nil || !sqsClient.isConfigured() {
 		log.Printf("Event (no SQS): %s %v", eventType, payload)
 		return
 	}
-	event := map[string]interface{}{
-		"type":      eventType,
-		"payload":   payload,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	}
-	data, _ := json.Marshal(event)
-	log.Printf("Event -> SQS: %s", string(data))
+	sqsClient.publish(context.Background(), eventType, payload)
 }
 
 func httpError(w http.ResponseWriter, msg string, code int) {
