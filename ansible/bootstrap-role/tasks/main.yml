@@ -2,9 +2,10 @@
 ---
 # tasks file for bootstrap-role
 - amazon.aws.s3_bucket:
-    name: ecsv3-bucket
+    name: eksv3-bucket
     state: present
     encryption: "AES256"
+    versioning: true
 
 - name: ecr-repo
   community.aws.ecs_ecr:
