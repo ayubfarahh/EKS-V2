@@ -40,5 +40,56 @@ module "cert_manager_pod_identity" {
   }
 }
 
+module "worker_pod_identity" {
+  source = "terraform-aws-modules/eks-pod-identity/aws"
 
+  name = "worker"
+
+  attach_custom_policy = true
+  policy_statements = [
+    {
+      sid     = "SQSConsume"
+      actions = [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+      ]
+      resources = [var.order_events_queue_arn]
+    }
+  ]
+
+  associations = {
+    this = {
+      cluster_name    = var.eks_cluster_name
+      namespace       = "app"
+      service_account = "worker"
+    }
+  }
+}
+
+
+module "publisher_pod_identity" {
+  source = "terraform-aws-modules/eks-pod-identity/aws"
+
+  name = "publisher"
+
+  attach_custom_policy = true
+  policy_statements = [
+    {
+      sid     = "SQSPublish"
+      actions = [
+        "sqs:SendMessage"
+      ]
+      resources = [var.order_events_queue_arn]
+    }
+  ]
+
+  associations = {
+    this = {
+      cluster_name    = var.eks_cluster_name
+      namespace       = "app"
+      service_account = "publisher"
+    }
+  }
+}
 // Varialise hosted zone later 

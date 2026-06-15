@@ -13,6 +13,7 @@ module "eks" {
 module "pod-id" {
     source = "./modules/pod-id"
     eks_cluster_name = module.eks.eks_cluster_name
+    order_events_queue_arn = module.sqs.order_events_queue_arn
 }
 
 module "sqs" {
