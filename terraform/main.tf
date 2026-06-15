@@ -14,3 +14,7 @@ module "pod-id" {
     source = "./modules/pod-id"
     eks_cluster_name = module.eks.eks_cluster_name
 }
+
+module "sqs" {
+    source = "./modules/sqs"
+}
