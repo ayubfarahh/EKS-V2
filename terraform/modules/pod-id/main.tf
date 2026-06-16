@@ -4,6 +4,11 @@ resource "aws_eks_addon" "pod_identity_agent" {
   
 }
 
+resource "aws_eks_addon" "ebs_csi" {
+  cluster_name = var.eks_cluster_name
+  addon_name   = "aws-ebs-csi-driver"
+}
+
 module "external_dns_pod_identity" {
   source = "terraform-aws-modules/eks-pod-identity/aws"
 
@@ -89,6 +94,22 @@ module "publisher_pod_identity" {
       cluster_name    = var.eks_cluster_name
       namespace       = "app"
       service_account = "publisher"
+    }
+  }
+}
+
+module "aws_ebs_csi_pod_identity" {
+  source = "terraform-aws-modules/eks-pod-identity/aws"
+
+  name = "aws-ebs-csi"
+
+  attach_aws_ebs_csi_policy = true
+
+  associations = {
+    this = {
+      cluster_name    = var.eks_cluster_name
+      namespace       = "kube-system"
+      service_account = "ebs-csi-controller-sa"
     }
   }
 }
