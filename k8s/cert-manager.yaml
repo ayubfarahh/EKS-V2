@@ -8,9 +8,10 @@ spec:
     server: https://acme-v02.api.letsencrypt.org/directory
     email: ayubfarahh@gmail.com
     privateKeySecretRef:
-      name: letsencrypt-prod
+      name: letsencrypt-prod-account-key
     # Enable the HTTP-01 challenge provider
     solvers:
       - dns01:
           route53:
             region: eu-west-2
+            hostedZoneID: Z0705516CKV60PQH3XUN
