@@ -9,3 +9,9 @@ parameters:
   type: gp3
   encrypted: "true"
 allowVolumeExpansion: true
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app

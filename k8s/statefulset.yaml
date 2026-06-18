@@ -19,21 +19,21 @@ metadata:
   name: postgres
   namespace: app
 spec:
-  serviceName: postgres          # must match your headless Service name
+  serviceName: postgres          
   replicas: 1
   selector:
     matchLabels:
-      app: postgres              # must match the Service selector + template labels
+      app: postgres              
   template:
     metadata:
       labels:
         app: postgres
     spec:
       securityContext:
-        fsGroup: 999             # postgres gid in the official image
+        fsGroup: 999             # volume mounted to root 
       containers:
         - name: postgres
-          image: postgres:17     # pin a version, don't use latest
+          image: postgres:17     
           ports:
             - containerPort: 5432
               name: postgres
@@ -51,7 +51,7 @@ spec:
                   name: postgres-secret
                   key: password
             - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata   # subdir, not the mount root
+              value: /var/lib/postgresql/data/pgdata   # subdir
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
